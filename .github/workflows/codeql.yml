@@ -1,0 +1,204 @@
+name: "CodeQL Security Analysis"
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly on Mondays at 8 AM UTC
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      scan_type:
+        description: 'Type of scan to perform'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - incremental
+      languages:
+        description: 'Languages to analyze'
+        required: true
+        default: 'python'
+        type: string
+
+jobs:
+  analyze:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        queries: +security-and-quality
+        config: |
+          name: "Custom CodeQL Config"
+          queries:
+            - uses: security-and-quality
+            - uses: security-experimental
+          
+    - name: Set up Python
+      if: matrix.language == 'python'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      if: matrix.language == 'python'
+      run: |
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        fi
+        if [ -f setup.py ]; then
+          pip install -e .
+        fi
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"
+        upload: true
+        wait-for-processing: true
+
+    - name: Upload SARIF results
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ runner.temp }}/results
+        category: ${{ matrix.language }}
+
+    - name: Security Report Summary
+      if: always()
+      run: |
+        echo "## CodeQL Security Analysis Complete 🔍" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Language Analyzed:** ${{ matrix.language }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Scan Type:** ${{ github.event.inputs.scan_type || 'scheduled' }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📊 **Results:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Check the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) for detailed findings" >> $GITHUB_STEP_SUMMARY
+        echo "- Review any new alerts and prioritize fixes based on severity" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "🔧 **Next Steps:**" >> $GITHUB_STEP_SUMMARY
+        echo "1. Review security alerts in the repository Security tab" >> $GITHUB_STEP_SUMMARY
+        echo "2. Fix critical and high-severity issues first" >> $GITHUB_STEP_SUMMARY
+        echo "3. Update dependencies if vulnerabilities are found" >> $GITHUB_STEP_SUMMARY
+        echo "4. Consider implementing additional security measures" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Security Notification
+    runs-on: ubuntu-latest
+    needs: analyze
+    if: always()
+    steps:
+    - name: Check for Security Alerts
+      id: check-alerts
+      run: |
+        # Get security alerts via GitHub API
+        ALERTS=$(curl -s \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${{ github.repository }}/code-scanning/alerts?state=open")
+        
+        ALERT_COUNT=$(echo "$ALERTS" | jq length)
+        echo "alert_count=$ALERT_COUNT" >> $GITHUB_OUTPUT
+        
+        if [ "$ALERT_COUNT" -gt 0 ]; then
+          echo "has_alerts=true" >> $GITHUB_OUTPUT
+          # Get high severity alerts
+          HIGH_SEVERITY=$(echo "$ALERTS" | jq '[.[] | select(.rule.severity == "error" or .rule.severity == "high")] | length')
+          echo "high_severity_count=$HIGH_SEVERITY" >> $GITHUB_OUTPUT
+        else
+          echo "has_alerts=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Security Issue
+      if: steps.check-alerts.outputs.has_alerts == 'true' && steps.check-alerts.outputs.high_severity_count > 0
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const alertCount = ${{ steps.check-alerts.outputs.alert_count }};
+          const highSeverityCount = ${{ steps.check-alerts.outputs.high_severity_count }};
+          
+          const issueBody = `🚨 **Security Alert**
+
+          CodeQL security scan has detected ${alertCount} security issues in the repository.
+
+          **Scan Details:**
+          - Repository: ${{ github.repository }}
+          - Commit: ${{ github.sha }}
+          - Branch: ${{ github.ref_name }}
+          - Scan Time: ${new Date().toISOString()}
+          - Total Alerts: ${alertCount}
+          - High/Critical Severity: ${highSeverityCount}
+
+          **⚠️ Immediate Action Required:**
+          ${highSeverityCount > 0 ? `- **${highSeverityCount} high/critical severity issues** need immediate attention` : ''}
+          - Review all security alerts in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)
+          - Prioritize fixes based on severity level
+          - Test fixes thoroughly before deploying
+
+          **🔗 Quick Links:**
+          - [View Security Alerts](https://github.com/${{ github.repository }}/security/code-scanning)
+          - [CodeQL Documentation](https://codeql.github.com/docs/)
+          - [Security Best Practices](https://docs.github.com/en/code-security)
+
+          ---
+          *This issue was automatically created by the CodeQL security workflow.*`;
+
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 Security Alert: ${alertCount} CodeQL Issues Detected`,
+            body: issueBody,
+            labels: ['security', 'codeql', 'urgent']
+          });
+
+    - name: Comment on PR
+      if: github.event_name == 'pull_request' && steps.check-alerts.outputs.has_alerts == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const alertCount = ${{ steps.check-alerts.outputs.alert_count }};
+          const comment = `## 🔍 CodeQL Security Analysis Results
+
+          **⚠️ Security Issues Detected:** ${alertCount} alerts found
+
+          This pull request introduces or contains security vulnerabilities detected by CodeQL analysis.
+
+          **📋 Next Steps:**
+          1. Review the [security alerts](https://github.com/${{ github.repository }}/security/code-scanning)
+          2. Fix identified issues before merging
+          3. Re-run the security scan to verify fixes
+
+          **🔒 Security is important!** Please address these issues before merging to maintain repository security.`;
+
+          await github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
